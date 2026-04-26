@@ -1,8 +1,15 @@
 #include <SDL3/SDL.h>
+#include <errno.h>
+#include <spawn.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <zlib.h>
 
 #include "qrcodegen.h"
+
+extern char **environ;
 
 #define WINDOW_TITLE "SDL3 GPU Template"
 #define WINDOW_WIDTH 800
@@ -13,18 +20,14 @@
 #define CANTO_END_MARKER "\n\n\n\nInferno\nCanto "
 
 static SDL_GPUShader *load_shader(SDL_GPUDevice *device,
-                                  const char *base_path,
-                                  const char *spv_name,
+                                  const char *spv_path,
                                   SDL_GPUShaderStage stage,
                                   Uint32 num_samplers,
                                   Uint32 num_uniform_buffers) {
-    char path[1024];
-    SDL_snprintf(path, sizeof(path), "%sshaders/%s", base_path, spv_name);
-
     size_t code_size = 0;
-    void *code = SDL_LoadFile(path, &code_size);
+    void *code = SDL_LoadFile(spv_path, &code_size);
     if (!code) {
-        SDL_Log("Failed to load %s: %s", path, SDL_GetError());
+        SDL_Log("Failed to load %s: %s", spv_path, SDL_GetError());
         return NULL;
     }
 
@@ -41,9 +44,90 @@ static SDL_GPUShader *load_shader(SDL_GPUDevice *device,
     SDL_GPUShader *shader = SDL_CreateGPUShader(device, &info);
     SDL_free(code);
     if (!shader) {
-        SDL_Log("SDL_CreateGPUShader failed for %s: %s", spv_name, SDL_GetError());
+        SDL_Log("SDL_CreateGPUShader failed for %s: %s", spv_path, SDL_GetError());
     }
     return shader;
+}
+
+static bool file_mtime(const char *path, time_t *out) {
+    struct stat st;
+    if (stat(path, &st) != 0) return false;
+    *out = st.st_mtime;
+    return true;
+}
+
+static bool compile_shader_glslc(const char *src_path, const char *spv_out_path) {
+    char *const argv_glslc[] = {
+        "glslc",
+        (char *)src_path,
+        "-o",
+        (char *)spv_out_path,
+        NULL,
+    };
+    pid_t pid;
+    int rc = posix_spawnp(&pid, "glslc", NULL, NULL, argv_glslc, environ);
+    if (rc != 0) {
+        SDL_Log("posix_spawnp(glslc) failed: %s", strerror(rc));
+        return false;
+    }
+    int status;
+    if (waitpid(pid, &status, 0) < 0) {
+        SDL_Log("waitpid failed: %s", strerror(errno));
+        return false;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static SDL_GPUGraphicsPipeline *build_pipeline(SDL_GPUDevice *device,
+                                               SDL_Window *window,
+                                               const char *vert_spv_path,
+                                               const char *frag_spv_path) {
+    SDL_GPUShader *vert = load_shader(device, vert_spv_path,
+                                      SDL_GPU_SHADERSTAGE_VERTEX, 0, 0);
+    SDL_GPUShader *frag = load_shader(device, frag_spv_path,
+                                      SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
+    if (!vert || !frag) {
+        if (vert) SDL_ReleaseGPUShader(device, vert);
+        if (frag) SDL_ReleaseGPUShader(device, frag);
+        return NULL;
+    }
+
+    SDL_GPUColorTargetDescription color_target_desc = {
+        .format = SDL_GetGPUSwapchainTextureFormat(device, window),
+    };
+
+    SDL_GPUGraphicsPipelineCreateInfo pipeline_info = {
+        .vertex_shader = vert,
+        .fragment_shader = frag,
+        .primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
+        .target_info = {
+            .color_target_descriptions = &color_target_desc,
+            .num_color_targets = 1,
+        },
+    };
+
+    SDL_GPUGraphicsPipeline *pipeline =
+        SDL_CreateGPUGraphicsPipeline(device, &pipeline_info);
+    SDL_ReleaseGPUShader(device, vert);
+    SDL_ReleaseGPUShader(device, frag);
+
+    if (!pipeline) {
+        SDL_Log("SDL_CreateGPUGraphicsPipeline failed: %s", SDL_GetError());
+    }
+    return pipeline;
+}
+
+// Resolve the absolute path to a shader source file. Tries in-tree dev location
+// (<basepath>../shaders/<name>) first, then deployed (<basepath>shaders/<name>).
+// Returns true if a path was filled in (even if the file doesn't exist at the
+// deployed location — the caller will discover that on first use).
+static bool resolve_source_path(const char *base_path, const char *name,
+                                char *out, size_t out_sz) {
+    struct stat st;
+    SDL_snprintf(out, out_sz, "%s../shaders/%s", base_path, name);
+    if (stat(out, &st) == 0) return true;
+    SDL_snprintf(out, out_sz, "%sshaders/%s", base_path, name);
+    return stat(out, &st) == 0;
 }
 
 /* Strip CR bytes in place (CRLF → LF). Returns the new length. */
@@ -249,8 +333,7 @@ static SDL_GPUTexture *load_canto_qr(SDL_GPUDevice *device,
 }
 
 int main(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
+    const char *frag_arg = (argc > 1) ? argv[1] : NULL;
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
@@ -293,36 +376,47 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    SDL_GPUShader *vert = load_shader(device, base_path, "triangle.vert.spv",
-                                      SDL_GPU_SHADERSTAGE_VERTEX, 0, 0);
-    SDL_GPUShader *frag = load_shader(device, base_path, "triangle.frag.spv",
-                                      SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
-    if (!vert || !frag) {
-        return 1;
+    // Source paths drive hot reload. The vertex shader is always the built-in
+    // triangle.vert; the fragment shader is either the CLI arg or triangle.frag.
+    // Loaded fragment shaders must declare the same bindings as triangle.frag:
+    // 1 sampler (set 2 binding 0 = u_qr) and 1 UBO (set 3 binding 0 = vec2 res,
+    // float time). They may be declared but unused.
+    char vert_src_path[1024] = {0};
+    char frag_src_path[1024] = {0};
+    resolve_source_path(base_path, "triangle.vert", vert_src_path,
+                        sizeof(vert_src_path));
+    if (frag_arg) {
+        SDL_strlcpy(frag_src_path, frag_arg, sizeof(frag_src_path));
+    } else {
+        resolve_source_path(base_path, "triangle.frag", frag_src_path,
+                            sizeof(frag_src_path));
     }
 
-    SDL_GPUColorTargetDescription color_target_desc = {
-        .format = SDL_GetGPUSwapchainTextureFormat(device, window),
-    };
+    // Hot-reload writes here on every successful recompile.
+    char vert_spv_tmp[1024], frag_spv_tmp[1024];
+    SDL_snprintf(vert_spv_tmp, sizeof(vert_spv_tmp),
+                 "%sshaders/_hot.vert.spv", base_path);
+    SDL_snprintf(frag_spv_tmp, sizeof(frag_spv_tmp),
+                 "%sshaders/_hot.frag.spv", base_path);
 
-    SDL_GPUGraphicsPipelineCreateInfo pipeline_info = {
-        .vertex_shader = vert,
-        .fragment_shader = frag,
-        .primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
-        .target_info = {
-            .color_target_descriptions = &color_target_desc,
-            .num_color_targets = 1,
-        },
-    };
+    // Initial .spv: prebuilt by CMake, except a CLI shader needs first compile.
+    char vert_spv_initial[1024], frag_spv_initial[1024];
+    SDL_snprintf(vert_spv_initial, sizeof(vert_spv_initial),
+                 "%sshaders/triangle.vert.spv", base_path);
+    if (frag_arg) {
+        if (!compile_shader_glslc(frag_arg, frag_spv_tmp)) {
+            SDL_Log("Initial compile of %s failed.", frag_arg);
+            return 1;
+        }
+        SDL_strlcpy(frag_spv_initial, frag_spv_tmp, sizeof(frag_spv_initial));
+    } else {
+        SDL_snprintf(frag_spv_initial, sizeof(frag_spv_initial),
+                     "%sshaders/triangle.frag.spv", base_path);
+    }
 
     SDL_GPUGraphicsPipeline *pipeline =
-        SDL_CreateGPUGraphicsPipeline(device, &pipeline_info);
-
-    SDL_ReleaseGPUShader(device, vert);
-    SDL_ReleaseGPUShader(device, frag);
-
+        build_pipeline(device, window, vert_spv_initial, frag_spv_initial);
     if (!pipeline) {
-        SDL_Log("SDL_CreateGPUGraphicsPipeline failed: %s", SDL_GetError());
         return 1;
     }
 
@@ -331,9 +425,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // LINEAR sampling for the QR. Combined with the smoothstep dilation in
+    // sample_qr(), edges stay crisp while the sub-pixel transition zone
+    // anti-aliases away the 3-vs-4-px-per-module aliasing.
     SDL_GPUSamplerCreateInfo sampler_info = {
-        .min_filter = SDL_GPU_FILTER_NEAREST,
-        .mag_filter = SDL_GPU_FILTER_NEAREST,
+        .min_filter = SDL_GPU_FILTER_LINEAR,
+        .mag_filter = SDL_GPU_FILTER_LINEAR,
         .mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
         .address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
         .address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
@@ -343,6 +440,17 @@ int main(int argc, char *argv[]) {
     if (!sampler) {
         SDL_Log("SDL_CreateGPUSampler failed: %s", SDL_GetError());
         return 1;
+    }
+
+    // Seed mtimes so the first frame doesn't trigger an immediate reload.
+    time_t vert_mtime = 0, frag_mtime = 0;
+    bool have_vert_src = file_mtime(vert_src_path, &vert_mtime);
+    bool have_frag_src = file_mtime(frag_src_path, &frag_mtime);
+    bool hot_reload_ok = have_vert_src && have_frag_src;
+    if (!hot_reload_ok) {
+        SDL_Log("Hot reload disabled (vert=%s, frag=%s).",
+                have_vert_src ? "ok" : "missing",
+                have_frag_src ? "ok" : "missing");
     }
 
     bool running = true;
@@ -360,6 +468,34 @@ int main(int argc, char *argv[]) {
                 break;
             default:
                 break;
+            }
+        }
+
+        if (hot_reload_ok) {
+            time_t mt;
+            bool changed = false;
+            if (file_mtime(vert_src_path, &mt) && mt != vert_mtime) {
+                vert_mtime = mt;
+                changed = true;
+            }
+            if (file_mtime(frag_src_path, &mt) && mt != frag_mtime) {
+                frag_mtime = mt;
+                changed = true;
+            }
+            if (changed) {
+                if (!compile_shader_glslc(vert_src_path, vert_spv_tmp) ||
+                    !compile_shader_glslc(frag_src_path, frag_spv_tmp)) {
+                    SDL_Log("Shader compile failed; keeping previous pipeline.");
+                } else {
+                    SDL_GPUGraphicsPipeline *new_pipe = build_pipeline(
+                        device, window, vert_spv_tmp, frag_spv_tmp);
+                    if (new_pipe) {
+                        SDL_WaitForGPUIdle(device);
+                        SDL_ReleaseGPUGraphicsPipeline(device, pipeline);
+                        pipeline = new_pipe;
+                        SDL_Log("Shader reloaded.");
+                    }
+                }
             }
         }
 

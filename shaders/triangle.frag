@@ -36,7 +36,12 @@ vec3 sample_qr(vec2 qr_uv) {
     if (qr_uv.x < 0.0 || qr_uv.x > 1.0 || qr_uv.y < 0.0 || qr_uv.y > 1.0) {
         return vec3(-1.0);
     }
-    float dark = texture(u_qr, qr_uv).r;
+    // Pixel-perfect sampling on top of LINEAR: snap to module centers, but
+    // anti-alias only the sub-pixel transition zone at module boundaries.
+    vec2 tex_size = vec2(textureSize(u_qr, 0));
+    vec2 px = qr_uv * tex_size;
+    vec2 module_uv = floor(px) + smoothstep(0.0, 1.0, fract(px) / fwidth(px));
+    float dark = texture(u_qr, module_uv / tex_size).r;
     return mix(vec3(1.0), vec3(0.0), dark);
 }
 
