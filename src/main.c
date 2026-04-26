@@ -1,13 +1,16 @@
 #include <SDL3/SDL.h>
 #include <string.h>
+#include <zlib.h>
 
 #include "qrcodegen.h"
 
 #define WINDOW_TITLE "SDL3 GPU Template"
 #define WINDOW_WIDTH 800
 #define WINDOW_HEIGHT 600
-#define QR_TEXT "Hello QR via SDL_GPU + GLSL"
 #define QR_QUIET_ZONE 4
+#define CANTO_FILE "divina_commedia_it.txt"
+#define CANTO_START_MARKER "Inferno\nCanto I\n"
+#define CANTO_END_MARKER "\n\n\n\nInferno\nCanto "
 
 static SDL_GPUShader *load_shader(SDL_GPUDevice *device,
                                   const char *base_path,
@@ -43,18 +46,100 @@ static SDL_GPUShader *load_shader(SDL_GPUDevice *device,
     return shader;
 }
 
-static SDL_GPUTexture *create_qr_texture(SDL_GPUDevice *device,
-                                         const char *text) {
-    uint8_t qrcode[qrcodegen_BUFFER_LEN_MAX];
-    uint8_t scratch[qrcodegen_BUFFER_LEN_MAX];
+/* Strip CR bytes in place (CRLF → LF). Returns the new length. */
+static size_t normalize_lf(char *s, size_t len) {
+    size_t w = 0;
+    for (size_t r = 0; r < len; r++) {
+        if (s[r] != '\r') s[w++] = s[r];
+    }
+    s[w] = '\0';
+    return w;
+}
 
-    bool ok = qrcodegen_encodeText(text, scratch, qrcode,
-                                   qrcodegen_Ecc_MEDIUM,
-                                   qrcodegen_VERSION_MIN,
-                                   qrcodegen_VERSION_MAX,
-                                   qrcodegen_Mask_AUTO, true);
+/* Slice the canto out of the full Divina Commedia text. The file marks each
+ * canto with "Inferno\nCanto N\n" headers separated by four blank lines. */
+static char *extract_canto_i(const char *src, size_t src_len, size_t *out_len) {
+    const char *start = strstr(src, CANTO_START_MARKER);
+    if (!start) {
+        SDL_Log("Could not find '%s' in source text", CANTO_START_MARKER);
+        return NULL;
+    }
+    start += strlen(CANTO_START_MARKER);
+    while (*start == '\n') start++;
+
+    const char *end = strstr(start, CANTO_END_MARKER);
+    if (!end) end = src + src_len;
+
+    size_t len = (size_t)(end - start);
+    char *out = (char *)SDL_malloc(len + 1);
+    if (!out) return NULL;
+    SDL_memcpy(out, start, len);
+    out[len] = '\0';
+    *out_len = len;
+    return out;
+}
+
+/* Raw deflate (no zlib/gzip wrapper). Returns malloc'd buffer; caller frees. */
+static uint8_t *deflate_raw(const void *src, size_t src_len, size_t *out_len) {
+    z_stream zs = {0};
+    int rc = deflateInit2(&zs, Z_BEST_COMPRESSION, Z_DEFLATED, -15, 9,
+                          Z_DEFAULT_STRATEGY);
+    if (rc != Z_OK) {
+        SDL_Log("deflateInit2 failed: %d", rc);
+        return NULL;
+    }
+
+    uLong bound = deflateBound(&zs, (uLong)src_len);
+    uint8_t *buf = (uint8_t *)SDL_malloc(bound);
+    if (!buf) {
+        deflateEnd(&zs);
+        return NULL;
+    }
+
+    zs.next_in = (Bytef *)src;
+    zs.avail_in = (uInt)src_len;
+    zs.next_out = buf;
+    zs.avail_out = (uInt)bound;
+
+    rc = deflate(&zs, Z_FINISH);
+    if (rc != Z_STREAM_END) {
+        SDL_Log("deflate failed: %d", rc);
+        SDL_free(buf);
+        deflateEnd(&zs);
+        return NULL;
+    }
+    *out_len = (size_t)zs.total_out;
+    deflateEnd(&zs);
+    return buf;
+}
+
+static SDL_GPUTexture *create_qr_texture_from_bytes(SDL_GPUDevice *device,
+                                                    const uint8_t *data,
+                                                    size_t data_len) {
+    if (data_len > qrcodegen_BUFFER_LEN_MAX) {
+        SDL_Log("Compressed payload (%zu bytes) exceeds max QR capacity",
+                data_len);
+        return NULL;
+    }
+
+    uint8_t *scratch = (uint8_t *)SDL_malloc(qrcodegen_BUFFER_LEN_MAX);
+    uint8_t *qrcode = (uint8_t *)SDL_malloc(qrcodegen_BUFFER_LEN_MAX);
+    if (!scratch || !qrcode) {
+        SDL_free(scratch);
+        SDL_free(qrcode);
+        return NULL;
+    }
+    SDL_memcpy(scratch, data, data_len);
+
+    bool ok = qrcodegen_encodeBinary(scratch, data_len, qrcode,
+                                     qrcodegen_Ecc_LOW,
+                                     qrcodegen_VERSION_MIN,
+                                     qrcodegen_VERSION_MAX,
+                                     qrcodegen_Mask_AUTO, true);
+    SDL_free(scratch);
     if (!ok) {
-        SDL_Log("qrcodegen_encodeText failed (text too long?)");
+        SDL_Log("qrcodegen_encodeBinary failed (payload too large for v40 ECC L?)");
+        SDL_free(qrcode);
         return NULL;
     }
 
@@ -62,9 +147,12 @@ static SDL_GPUTexture *create_qr_texture(SDL_GPUDevice *device,
     int tex_size = qr_size + 2 * QR_QUIET_ZONE;
     size_t bytes = (size_t)tex_size * (size_t)tex_size;
 
+    SDL_Log("QR: %zu bytes payload → version %d (%dx%d modules)", data_len,
+            (qr_size - 17) / 4, qr_size, qr_size);
+
     uint8_t *pixels = (uint8_t *)SDL_calloc(1, bytes);
     if (!pixels) {
-        SDL_Log("Out of memory building QR pixel buffer");
+        SDL_free(qrcode);
         return NULL;
     }
     for (int y = 0; y < qr_size; y++) {
@@ -75,6 +163,7 @@ static SDL_GPUTexture *create_qr_texture(SDL_GPUDevice *device,
             }
         }
     }
+    SDL_free(qrcode);
 
     SDL_GPUTextureCreateInfo tex_info = {
         .type = SDL_GPU_TEXTURETYPE_2D,
@@ -125,6 +214,37 @@ static SDL_GPUTexture *create_qr_texture(SDL_GPUDevice *device,
     SDL_SubmitGPUCommandBuffer(cmd);
     SDL_ReleaseGPUTransferBuffer(device, tbuf);
 
+    return tex;
+}
+
+static SDL_GPUTexture *load_canto_qr(SDL_GPUDevice *device,
+                                     const char *base_path) {
+    char path[1024];
+    SDL_snprintf(path, sizeof(path), "%s%s", base_path, CANTO_FILE);
+
+    size_t file_len = 0;
+    void *file_data = SDL_LoadFile(path, &file_len);
+    if (!file_data) {
+        SDL_Log("Failed to load %s: %s", path, SDL_GetError());
+        return NULL;
+    }
+    file_len = normalize_lf((char *)file_data, file_len);
+
+    size_t canto_len = 0;
+    char *canto = extract_canto_i((const char *)file_data, file_len, &canto_len);
+    SDL_free(file_data);
+    if (!canto) return NULL;
+
+    size_t deflated_len = 0;
+    uint8_t *deflated = deflate_raw(canto, canto_len, &deflated_len);
+    SDL_Log("Canto I: %zu bytes raw → %zu bytes deflated (%.1f%%)", canto_len,
+            deflated_len, 100.0 * deflated_len / (double)canto_len);
+    SDL_free(canto);
+    if (!deflated) return NULL;
+
+    SDL_GPUTexture *tex =
+        create_qr_texture_from_bytes(device, deflated, deflated_len);
+    SDL_free(deflated);
     return tex;
 }
 
@@ -206,7 +326,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    SDL_GPUTexture *qr_tex = create_qr_texture(device, QR_TEXT);
+    SDL_GPUTexture *qr_tex = load_canto_qr(device, base_path);
     if (!qr_tex) {
         return 1;
     }
@@ -276,9 +396,17 @@ int main(int argc, char *argv[]) {
             };
             SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
 
-            float resolution[2] = {(float)swap_w, (float)swap_h};
-            SDL_PushGPUFragmentUniformData(cmd, 0, resolution,
-                                           sizeof(resolution));
+            // std140 block: vec2 resolution, float time, plus 4-byte pad
+            // to round the block size up to 16 bytes.
+            // NOTE: 165-module QR @ ~3.12 px/module produces some 3-px and
+            // some 4-px modules under NEAREST sampling — known aliasing.
+            float ubo[4] = {
+                (float)swap_w,
+                (float)swap_h,
+                (float)SDL_GetTicks() / 1000.0f,
+                0.0f,
+            };
+            SDL_PushGPUFragmentUniformData(cmd, 0, ubo, sizeof(ubo));
 
             SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
             SDL_EndGPURenderPass(pass);

@@ -6,6 +6,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(SDL3 REQUIRED CONFIG)
+find_package(ZLIB REQUIRED)
 
 find_program(GLSLC_EXECUTABLE glslc REQUIRED)
 
@@ -40,10 +41,17 @@ add_executable(${PROJECT_NAME} src/main.c)
 add_dependencies(${PROJECT_NAME} shaders)
 
 target_include_directories(${PROJECT_NAME} PRIVATE include)
-target_link_libraries(${PROJECT_NAME} PRIVATE SDL3::SDL3 qrcodegen)
+target_link_libraries(${PROJECT_NAME} PRIVATE SDL3::SDL3 qrcodegen ZLIB::ZLIB)
 
 if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE /W4)
 else()
     target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_CURRENT_SOURCE_DIR}/divina_commedia_it.txt
+        $<TARGET_FILE_DIR:${PROJECT_NAME}>/divina_commedia_it.txt
+    VERBATIM
+)
