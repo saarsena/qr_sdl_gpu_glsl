@@ -6,13 +6,15 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(SDL3 REQUIRED CONFIG)
-find_package(ZLIB REQUIRED)
 
 find_program(GLSLC_EXECUTABLE glslc REQUIRED)
 
 set(SHADER_SOURCES
     shaders/triangle.vert
     shaders/triangle.frag
+    shaders/scarf.frag
+    shaders/gravitational_waves_kerr.frag
+    shaders/wolframs.frag
 )
 
 set(SHADER_OUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
@@ -32,7 +34,28 @@ foreach(SHADER IN LISTS SHADER_SOURCES)
     list(APPEND SHADER_OUTPUTS ${SPV_OUTPUT})
 endforeach()
 
+# Feedback shaders need a second compile with -DDOUBLE_BUFFER_0 for the
+# propagation pass (alongside the regular display variant emitted above).
+set(FEEDBACK_SHADERS shaders/wolframs.frag)
+foreach(SHADER IN LISTS FEEDBACK_SHADERS)
+    get_filename_component(SHADER_NAME ${SHADER} NAME)
+    set(SPV_OUTPUT ${SHADER_OUT_DIR}/${SHADER_NAME}.compute.spv)
+    add_custom_command(
+        OUTPUT ${SPV_OUTPUT}
+        COMMAND ${GLSLC_EXECUTABLE} -DDOUBLE_BUFFER_0=1
+                ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER} -o ${SPV_OUTPUT}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER}
+        COMMENT "glslc ${SHADER} (compute variant)"
+        VERBATIM
+    )
+    list(APPEND SHADER_OUTPUTS ${SPV_OUTPUT})
+endforeach()
+
 add_custom_target(shaders DEPENDS ${SHADER_OUTPUTS})
+
+add_library(stb_image STATIC vendor/stb/stb_image.c)
+target_include_directories(stb_image PUBLIC vendor/stb)
+target_compile_options(stb_image PRIVATE -w)  # don't lint third-party code
 
 add_library(qrcodegen STATIC vendor/qrcodegen/qrcodegen.c)
 target_include_directories(qrcodegen PUBLIC vendor/qrcodegen)
@@ -41,7 +64,10 @@ add_executable(${PROJECT_NAME} src/main.c)
 add_dependencies(${PROJECT_NAME} shaders)
 
 target_include_directories(${PROJECT_NAME} PRIVATE include)
-target_link_libraries(${PROJECT_NAME} PRIVATE SDL3::SDL3 qrcodegen ZLIB::ZLIB)
+target_link_libraries(${PROJECT_NAME} PRIVATE SDL3::SDL3 stb_image qrcodegen)
+if(UNIX AND NOT APPLE)
+    target_link_libraries(${PROJECT_NAME} PRIVATE m)
+endif()
 
 if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE /W4)
@@ -50,8 +76,8 @@ else()
 endif()
 
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        ${CMAKE_CURRENT_SOURCE_DIR}/divina_commedia_it.txt
-        $<TARGET_FILE_DIR:${PROJECT_NAME}>/divina_commedia_it.txt
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_CURRENT_SOURCE_DIR}/assets
+        $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets
     VERBATIM
 )

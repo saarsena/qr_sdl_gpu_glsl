@@ -1,0 +1,41 @@
+#version 430 core
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+struct Particle {
+    vec4 pos;      // xyz = position
+    vec4 prev_pos; // xyz = previous position
+};
+
+layout(std430, binding = 0) buffer ParticleBuffer {
+    Particle particles[];
+};
+
+uniform float dt;
+uniform float a;
+uniform float b;
+uniform float c;
+uniform float d;
+uniform float e;
+
+// Aizawa Attractor logic
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= particles.length()) return;
+
+    vec3 p = particles[i].pos.xyz;
+    
+    // Store current as previous before update
+    particles[i].prev_pos.xyz = p;
+
+    // Aizawa Equations
+    float dx = (p.z - b) * p.x - d * p.y;
+    float dy = d * p.x + (p.z - b) * p.y;
+    float dz = c + a * p.z - (p.z * p.z * p.z) / 3.0 
+             - (p.x * p.x + p.y * p.y) * (1.0 + e * p.z) 
+             + 0.1 * p.z * (p.x * p.x * p.x);
+
+    // Euler integration
+    p += vec3(dx, dy, dz) * dt;
+
+    particles[i].pos.xyz = p;
+}

@@ -24,7 +24,8 @@ CMakeFiles/
 cmake_install.cmake
 Makefile
 compile_commands.json
-
+frames_dir/
+aiwaza/
 # Dependencies fetched by CMake
 _deps/
 external/*/
@@ -35,4 +36,5 @@ Thumbs.db
 
 # AI generated files
 CLAUDE.md
-
+*.mp4
+*.png

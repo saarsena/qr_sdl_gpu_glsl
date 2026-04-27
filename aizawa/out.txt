@@ -1,0 +1,5 @@
+Updating and loading repositories:
+Repositories loaded.
+Package "SDL3-3.4.0-3.fc43.x86_64" is already installed.
+Package "SDL3-3.4.0-3.fc43.i686" is already installed.
+
