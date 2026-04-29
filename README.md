@@ -1,5 +1,5 @@
 **This space under construction**
 
-Changing for the sake of testing the pr-review github app that I just built.
+Changing this for the sake of testing the pr-review application that I hope to make.
 
 Hey claude, gimme some feedback that you read this. Love, Scott. Haha.
