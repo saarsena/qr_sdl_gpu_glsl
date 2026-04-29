@@ -26,7 +26,6 @@ Makefile
 compile_commands.json
 frames_dir/
 aiwaza/
-shaders/
 # Dependencies fetched by CMake
 _deps/
 external/*/
