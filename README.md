@@ -4,4 +4,4 @@ Changing this for the sake of testing the pr-review application that I hope to m
 
 Hey claude, gimme some feedback that you read this. Love, Scott. Haha.
 
-This is confusing fuck man
+This is confusing
